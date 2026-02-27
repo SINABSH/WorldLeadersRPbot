@@ -1,388 +1,598 @@
 import json
 import os
 import logging
-import asyncio
-import math
 from datetime import datetime, timedelta
-from telegram import Update, User
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.constants import ParseMode
+from telegram import Update, BotCommand
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- Configuration ---
-BOT_TOKEN = "" # توکن خود را اینجا قرار دهید
-DATA_FILE = "rp_master_data.json"
+# --- تنظیمات اولیه ---
+BOT_TOKEN = "xxxxxxx" # توکن ربات خود را اینجا بگذارید
+DATA_FILE = "rp_data.json"
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# --- Database Setup ---
+# --- سیستم دیتابیس (تفکیک شده بر اساس گروه) ---
+# ساختار جدید: db[chat_id] = {"users": {}, "countries": {}, "alliances": [], "wars": [], "requests": {}, "market": {}}
+
 def load_db():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-db = load_db()
-
 def save_db():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=4)
 
-def init_group(chat_id):
-    gid = str(chat_id)
-    if gid not in db:
-        db[gid] = {
+db = load_db()
+
+# --- توابع کمکی ---
+def get_group_db(chat_id):
+    chat_id = str(chat_id)
+    if chat_id not in db:
+        db[chat_id] = {
             "users": {},
             "countries": {},
             "alliances": [],
             "wars": [],
-            "market": [] # {seller_id, item_type, amount, price, id}
+            "requests": {},
+            "market": {} # برای فروش شهرها: seller_id -> {"target_id": id, "cities": count, "price": price}
         }
-    return db[gid]
+    return db[chat_id]
 
-# --- Calculation Helpers ---
-def get_factory_price(count):
-    # قیمت پایه ۱۳۰۰، افزایش ۱۰٪ به ازای هر سطح قبلی بصورت تصاعدی
-    # کارخانه اول: ۱۳۰۰، دوم: ۱۳۰۰ + ۱۰٪، سوم: قبلی + ۲۰٪ و ...
-    base = 1300
-    total_price = base
-    for i in range(1, count + 1):
-        total_price += total_price * (0.1 * i)
-    return int(total_price)
+def get_user_id_by_country(group_db, country_name):
+    for c, uid in group_db["countries"].items():
+        if c.lower() == country_name.lower():
+            return uid
+    return None
 
-def get_time_diff(target_time_iso):
-    now = datetime.now()
-    target = datetime.fromisoformat(target_time_iso)
-    diff = target - now
-    if diff.total_seconds() <= 0:
-        return None
-    minutes, seconds = divmod(int(diff.total_seconds()), 60)
-    return f"{minutes:02d}:{seconds:02d}"
+def get_country_by_user_id(group_db, user_id):
+    user_id = str(user_id)
+    if user_id in group_db["users"]:
+        return group_db["users"][user_id]["country"]
+    return None
 
-# --- Commands ---
+def is_allied(group_db, uid1, uid2):
+    return [uid1, uid2] in group_db["alliances"] or [uid2, uid1] in group_db["alliances"]
 
-async def set_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # این تابع برای ست کردن لیست کامندها در منوی تلگرام است
+def is_at_war(group_db, uid1, uid2):
+    return [uid1, uid2] in group_db["wars"] or [uid2, uid1] in group_db["wars"]
+
+async def check_bankruptcy(update, group_db, user_id):
+    """بررسی ورشکستگی در صورت از دست دادن تمام شهرها"""
+    user_id = str(user_id)
+    if user_id in group_db["users"] and group_db["users"][user_id]["cities"] <= 0:
+        country_name = group_db["users"][user_id]["country"]
+        
+        # حذف اطلاعات کاربر از همه جا
+        del group_db["users"][user_id]
+        if country_name in group_db["countries"]:
+            del group_db["countries"][country_name]
+            
+        group_db["alliances"] = [a for a in group_db["alliances"] if user_id not in a]
+        group_db["wars"] = [w for w in group_db["wars"] if user_id not in w]
+        
+        if user_id in group_db["requests"]:
+            del group_db["requests"][user_id]
+        
+        save_db()
+        await update.message.reply_text(f"💀 **سقوط یک امپراتوری!**\nکشور **{country_name}** تمام شهرهای خود را از دست داد و به طور کامل از نقشه جهان محو شد!", parse_mode='Markdown')
+        return True
+    return False
+
+# --- تنظیم منوی کامندها ---
+async def post_init(application):
     commands = [
-        ("start", "شروع ربات"),
-        ("help", "راهنمای کامل"),
-        ("claim", "ثبت کشور [نام]"),
-        ("profile", "مشاهده پروفایل خود یا دیگران"),
-        ("world", "نقشه جهانی و آمار"),
-        ("tax", "دریافت مالیات"),
-        ("build", "خرید شهر یا کارخانه"),
-        ("rename", "تغییر نام کشور"),
-        ("sell", "فروش ملک در بازار"),
-        ("market", "لیست بازار فروش"),
-        ("buy", "خرید از بازار [کد]"),
-        ("give", "انتقال مستقیم به دیگران"),
-        ("war", "اعلان جنگ"),
-        ("ally", "پیشنهاد اتحاد")
+        BotCommand("claim", "تصاحب و رهبری یک کشور"),
+        BotCommand("profile", "مشاهده پروفایل (یا پروفایل دیگران با منشن)"),
+        BotCommand("world", "مشاهده نقشه سیاسی جهان"),
+        BotCommand("tax", "جمع‌آوری مالیات (هر ۳۰ دقیقه)"),
+        BotCommand("military", "خرید نیروی نظامی"),
+        BotCommand("rename", "تغییر نام کشور"),
+        BotCommand("color", "تغییر رنگ/ایموجی کشور در نقشه"),
+        BotCommand("send", "ارسال سکه به کشور دیگر"),
+        BotCommand("sendcity", "انتقال رایگان شهر به کشور دیگر"),
+        BotCommand("sellcity", "فروش شهر با قیمت دلخواه"),
+        BotCommand("acceptcity", "تایید خرید شهر"),
+        BotCommand("ally", "پیشنهاد اتحاد"),
+        BotCommand("accept", "پذیرش اتحاد"),
+        BotCommand("war", "اعلان جنگ"),
+        BotCommand("peace", "پیشنهاد صلح"),
+        BotCommand("acceptpeace", "پذیرش صلح"),
+        BotCommand("help", "لیست کامل راهنما")
     ]
-    await context.bot.set_my_commands(commands)
-    await update.message.reply_text("✅ لیست دستورات در منوی تلگرام بروزرسانی شد.")
+    await application.bot.set_my_commands(commands)
+
+# --- دستورات ربات ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🇮🇷 به ربات رول‌پلی پیشرفته خوش آمدید!\nبرای شروع از `/claim [نام کشور]` استفاده کنید.")
+    welcome_text = (
+        "🌍 *به ربات مدیریت رول‌پلی ژئوپلیتیک خوش آمدید!*\n\n"
+        "برای شروع در این گروه، یک کشور را با دستور زیر انتخاب کنید:\n"
+        "`/claim [نام کشور]`\n\n"
+        "برای دیدن راهنما `/help` را بزنید."
+    )
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📜 *راهنمای کامل دستورات:*\n\n"
+        "🌍 `/claim [نام]` - تاسیس کشور\n"
+        "👤 `/profile` یا `/profile @user` - وضعیت کشور\n"
+        "🗺 `/world` - نقشه جهان\n"
+        "🔄 `/rename [نام جدید]` - تغییر نام کشور\n"
+        "🎨 `/color [ایموجی]` - تعیین رنگ کشور در نقشه\n\n"
+        "💰 `/tax` - مالیات (هر شهر ۷۰ سکه در نیم ساعت)\n"
+        "🪖 `/military [تعداد]` - خرید ارتش (هر نیرو ۱۰ سکه)\n"
+        "💸 `/send [کشور] [مبلغ]` - کمک مالی\n\n"
+        "🏙 `/sendcity [کشور] [تعداد]` - واگذاری شهر\n"
+        "🤝 `/sellcity [کشور] [تعداد] [مبلغ]` - پیشنهاد فروش شهر\n"
+        "✅ `/acceptcity [کشور فروشنده]` - خرید شهر پیشنهاد شده\n\n"
+        "🤝 `/ally [کشور]` | ✅ `/accept [کشور]` - دیپلماسی\n"
+        "⚔️ `/war [کشور]` - اعلان جنگ\n"
+        "🕊 `/peace [کشور]` | ✅ `/acceptpeace [کشور]` - صلح"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    user_name = update.message.from_user.first_name
+    username = update.message.from_user.username
 
-    if uid in g_db["users"]:
-        return await update.message.reply_text("❌ شما در این گروه قبلاً کشور ثبت کرده‌اید.")
-    
-    if not context.args:
-        return await update.message.reply_text("❌ نام کشور را وارد کنید.")
-    
-    c_name = " ".join(context.args)
-    if c_name in g_db["countries"]:
-        return await update.message.reply_text("❌ این نام کشور رزرو شده است.")
+    if len(context.args) == 0:
+        return await update.message.reply_text("❌ لطفاً نام کشور را وارد کنید. مثال: `/claim Iran`")
 
-    g_db["users"][uid] = {
-        "name": update.effective_user.first_name,
-        "country": c_name,
-        "color": "⚪️",
+    country_name = " ".join(context.args)
+
+    if user_id in group_db["users"]:
+        current_country = group_db["users"][user_id]["country"]
+        return await update.message.reply_text(f"❌ شما در این گروه رهبر **{current_country}** هستید!", parse_mode='Markdown')
+
+    for existing_country in group_db["countries"]:
+        if existing_country.lower() == country_name.lower():
+            return await update.message.reply_text(f"❌ کشور **{existing_country}** قبلاً انتخاب شده است.", parse_mode='Markdown')
+
+    group_db["users"][user_id] = {
+        "name": user_name,
+        "username": username.lower() if username else "",
+        "country": country_name,
+        "color": "⚪️", # رنگ پیش‌فرض
         "money": 5000,
         "army": 100,
-        "cities": 21,
-        "factories": 0,
-        "last_tax": (datetime.now() - timedelta(minutes=30)).isoformat(),
-        "last_factory_prod": datetime.now().isoformat()
+        "cities": 21, # تعداد شهرهای اولیه
+        "last_tax": "2000-01-01T00:00:00"
     }
-    g_db["countries"][c_name] = uid
+    group_db["countries"][country_name] = user_id
     save_db()
-    await update.message.reply_text(f"✅ کشور **{c_name}** با ۲۱ شهر تاسیس شد!", parse_mode=ParseMode.MARKDOWN)
+
+    await update.message.reply_text(
+        f"🎉 تبریک! شما رهبری **{country_name}** را بر عهده گرفتید.\n\n"
+        f"🏙 شهرها: 21\n💰 بودجه: 5000\n🪖 ارتش: 100", parse_mode='Markdown'
+    )
+
+async def rename_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+
+    if user_id not in group_db["users"]:
+        return await update.message.reply_text("❌ شما کشوری ندارید.")
+    if len(context.args) == 0:
+        return await update.message.reply_text("❌ نام جدید را وارد کنید: `/rename NewName`")
+
+    new_name = " ".join(context.args)
+    old_name = group_db["users"][user_id]["country"]
+
+    for existing_country in group_db["countries"]:
+        if existing_country.lower() == new_name.lower():
+            return await update.message.reply_text("❌ این نام قبلاً ثبت شده است.")
+
+    del group_db["countries"][old_name]
+    group_db["countries"][new_name] = user_id
+    group_db["users"][user_id]["country"] = new_name
+    save_db()
+
+    await update.message.reply_text(f"🔄 نام کشور شما از **{old_name}** به **{new_name}** تغییر یافت.", parse_mode='Markdown')
+
+async def set_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+
+    if user_id not in group_db["users"]:
+        return await update.message.reply_text("❌ کشوری ندارید.")
+    if len(context.args) == 0:
+        return await update.message.reply_text("❌ یک ایموجی یا رنگ وارد کنید. مثال: `/color 🔴`")
+
+    color = context.args[0]
+    group_db["users"][user_id]["color"] = color
+    save_db()
+    await update.message.reply_text(f"🎨 رنگ کشور شما در نقشه به {color} تغییر یافت.")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    g_db = init_group(gid)
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    target_id = user_id
+
+    # بررسی منشن
+    if len(context.args) > 0 and context.args[0].startswith('@'):
+        target_username = context.args[0].replace('@', '').lower()
+        found = False
+        for uid, data in group_db["users"].items():
+            if data.get("username", "") == target_username:
+                target_id = uid
+                found = True
+                break
+        if not found:
+            return await update.message.reply_text("❌ کاربری با این آیدی در سیستم ثبت نشده است.")
     
-    target_uid = str(update.effective_user.id)
+    if target_id not in group_db["users"]:
+        if target_id == user_id:
+            return await update.message.reply_text("❌ شما کشوری ندارید! `/claim` کنید.")
+        else:
+            return await update.message.reply_text("❌ این کاربر کشوری ندارد.")
+
+    user_data = group_db["users"][target_id]
+    country = user_data["country"]
+    color = user_data.get("color", "⚪️")
     
-    # Check for mention or reply
-    if update.message.reply_to_message:
-        target_uid = str(update.message.reply_to_message.from_user.id)
-    elif context.args and update.message.entities:
-        for ent in update.message.entities:
-            if ent.type == "mention":
-                # Note: Mentions need complex resolving, for simplicity we check if the user is in db
-                mention_text = update.message.text[ent.offset:ent.offset+ent.length]
-                # Filter through users to find name match if possible or just use mention logic
-                pass
+    allies = []
+    enemies = []
+    for pair in group_db["alliances"]:
+        if target_id in pair:
+            other_id = pair[0] if pair[1] == target_id else pair[1]
+            allies.append(get_country_by_user_id(group_db, other_id))
+            
+    for pair in group_db["wars"]:
+        if target_id in pair:
+            other_id = pair[0] if pair[1] == target_id else pair[1]
+            enemies.append(get_country_by_user_id(group_db, other_id))
 
-    if target_uid not in g_db["users"]:
-        return await update.message.reply_text("❌ این کاربر در این گروه کشوری ندارد.")
-
-    u = g_db["users"][target_uid]
-    tax_timer = get_time_diff((datetime.fromisoformat(u["last_tax"]) + timedelta(minutes=30)).isoformat())
-    tax_status = "✅ آماده دریافت" if not tax_timer else f"⏳ {tax_timer}"
-
-    msg = (
-        f"{u['color']} **کشور: {u['country']}**\n"
-        f"👤 رهبر: {u['name']}\n"
-        f"➖➖➖➖➖➖\n"
-        f"💰 خزانه: {u['money']:,} سکه\n"
-        f"🏙 شهرها: {u['cities']}\n"
-        f"🏭 کارخانه‌ها: {u['factories']}\n"
-        f"🪖 ارتش: {u['army']:,} نیرو\n"
-        f"➖➖➖➖➖➖\n"
-        f"💵 مالیات بعدی: {tax_status}\n"
-        f"🛠 قیمت کارخانه بعدی: {get_factory_price(u['factories']):,}"
+    profile_text = (
+        f"🏛 **دولت {country}** {color}\n"
+        f"👤 رهبر: {user_data['name']}\n\n"
+        f"🏙 تعداد شهرها: {user_data.get('cities', 21)}\n"
+        f"💰 خزانه: {user_data['money']} سکه\n"
+        f"🪖 ارتش: {user_data['army']} سرباز\n\n"
+        f"🤝 متحدین: {('، '.join(allies)) if allies else 'ندارد'}\n"
+        f"⚔️ در جنگ با: {('، '.join(enemies)) if enemies else 'ندارد'}"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-async def tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-
-    if uid not in g_db["users"]: return
-    u = g_db["users"][uid]
-    
-    now = datetime.now()
-    last_tax = datetime.fromisoformat(u["last_tax"])
-    
-    if now < last_tax + timedelta(minutes=30):
-        timer = get_time_diff((last_tax + timedelta(minutes=30)).isoformat())
-        return await update.message.reply_text(f"⏳ زمان باقی‌مانده: {timer}")
-
-    # هر شهر ۷۰ سکه مالیات
-    income = u["cities"] * 70
-    u["money"] += income
-    u["last_tax"] = now.isoformat()
-    
-    # تولید نیروی کارخانه (هر کارخانه ۱۰ نیرو در ساعت)
-    # اینجا ساده‌سازی شده: موقع مالیات، تولید کارخانه هم چک می‌شود
-    last_prod = datetime.fromisoformat(u["last_factory_prod"])
-    hours = (now - last_prod).total_seconds() / 3600
-    new_army = int(hours * u["factories"] * 10)
-    u["army"] += new_army
-    u["last_factory_prod"] = now.isoformat()
-
-    save_db()
-    await update.message.reply_text(f"💰 مالیات دریافت شد!\n💵 سود بانکی: {income:,}\n🪖 نیروهای جدید کارخانه: {new_army}")
-
-async def rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-
-    if uid not in g_db["users"] or not context.args: return
-    new_name = " ".join(context.args)
-    
-    if new_name in g_db["countries"]:
-        return await update.message.reply_text("❌ این نام قبلاً انتخاب شده است.")
-    
-    old_name = g_db["users"][uid]["country"]
-    del g_db["countries"][old_name]
-    g_db["users"][uid]["country"] = new_name
-    g_db["countries"][new_name] = uid
-    save_db()
-    await update.message.reply_text(f"✅ نام کشور به {new_name} تغییر یافت.")
+    await update.message.reply_text(profile_text, parse_mode='Markdown')
 
 async def world(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    g_db = init_group(gid)
-    if not g_db["users"]: return await update.message.reply_text("نقشه خالی است.")
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
 
-    text = "🌍 **آمار جهانی این گروه:**\n\n"
-    for uid, u in g_db["users"].items():
-        text += f"{u['color']} **{u['country']}**: 🏙 {u['cities']} | 🏭 {u['factories']} | 🪖 {u['army']}\n"
-    
-    # نمایش اتحادها و جنگ‌ها
-    if g_db["alliances"]:
-        text += "\n🤝 **اتحادها:**\n"
-        for a in g_db["alliances"]:
-            text += f"- {g_db['users'][a[0]]['country']} 🤝 {g_db['users'][a[1]]['country']}\n"
+    if not group_db["countries"]:
+        return await update.message.reply_text("🌍 جهان هنوز خالی از سکنه است!")
+
+    text = "🌍 **نقشه سیاسی جهان:**\n\n"
+    for country, uid in group_db["countries"].items():
+        user = group_db["users"][uid]
+        color = user.get("color", "⚪️")
+        text += f"{color} **{country}** | 🏙 {user.get('cities', 21)} | 🪖 {user['army']}\n"
+
+    # اضافه کردن بخش جنگ‌ها و اتحادها به پایین نقشه
+    if group_db["wars"]:
+        text += "\n⚔️ **جنگ‌های فعال:**\n"
+        for w in group_db["wars"]:
+            c1 = get_country_by_user_id(group_db, w[0])
+            c2 = get_country_by_user_id(group_db, w[1])
+            text += f"▪️ {c1} ⚔️ {c2}\n"
             
-    if g_db["wars"]:
-        text += "\n⚔️ **جنگ‌های جاری:**\n"
-        for w in g_db["wars"]:
-            text += f"- {g_db['users'][w[0]]['country']} 🔥 {g_db['users'][w[1]]['country']}\n"
+    if group_db["alliances"]:
+        text += "\n🤝 **اتحادهای بزرگ:**\n"
+        for a in group_db["alliances"]:
+            c1 = get_country_by_user_id(group_db, a[0])
+            c2 = get_country_by_user_id(group_db, a[1])
+            text += f"▪️ {c1} 🤝 {c2}\n"
 
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def build(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-    if uid not in g_db["users"]: return
+async def tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
 
-    if not context.args:
-        return await update.message.reply_text("💡 مثال: `/build factory` یا `/build city` (قیمت شهر: ۵۰۰۰)")
+    if user_id not in group_db["users"]:
+        return await update.message.reply_text("❌ شما هنوز کشوری ندارید!")
 
-    u = g_db["users"][uid]
-    item = context.args[0].lower()
+    user_data = group_db["users"][user_id]
+    last_tax = datetime.fromisoformat(user_data["last_tax"])
+    now = datetime.now()
 
-    if item == "factory":
-        price = get_factory_price(u["factories"])
-        if u["money"] >= price:
-            u["money"] -= price
-            u["factories"] += 1
-            save_db()
-            await update.message.reply_text(f"🏭 کارخانه شماره {u['factories']} ساخته شد!")
-        else:
-            await update.message.reply_text(f"❌ موجودی کافی نیست. نیاز به {price:,} دارید.")
+    if now < last_tax + timedelta(minutes=30):
+        remaining = (last_tax + timedelta(minutes=30)) - now
+        minutes, seconds = divmod(int(remaining.total_seconds()), 60)
+        return await update.message.reply_text(f"⏳ لطفاً {minutes} دقیقه و {seconds} ثانیه دیگر برای جمع‌آوری مالیات مراجعه کنید.")
+
+    cities = user_data.get("cities", 21)
+    tax_amount = cities * 70  # هر شهر 70 سکه
     
-    elif item == "city":
-        if u["money"] >= 5000:
-            u["money"] -= 5000
-            u["cities"] += 1
-            save_db()
-            await update.message.reply_text("🏙 یک شهر جدید به قلمرو اضافه شد!")
-        else:
-            await update.message.reply_text("❌ پول کافی برای خرید شهر ندارید (۵۰۰۰ سکه).")
+    user_data["money"] += tax_amount
+    user_data["last_tax"] = now.isoformat()
+    save_db()
 
-async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-    if uid not in g_db["users"]: return
+    await update.message.reply_text(f"💰 مالیات جمع‌آوری شد!\nمبلغ **{tax_amount}** سکه (به ازای {cities} شهر) به خزانه **{user_data['country']}** واریز شد.", parse_mode='Markdown')
 
-    # /sell city 1 1000
-    if len(context.args) < 3:
-        return await update.message.reply_text("💡 دستور: `/sell [نوع] [تعداد] [قیمت_کل]`\nمثال: `/sell factory 1 2000`")
+# --- بخش شهرسازی و انتقال ---
 
-    itype = context.args[0].lower() # city / factory
-    amount = int(context.args[1])
-    price = int(context.args[2])
-    u = g_db["users"][uid]
+async def send_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
 
-    if itype == "city" and u["cities"] > amount:
-        u["cities"] -= amount
-    elif itype == "factory" and u["factories"] >= amount:
-        u["factories"] -= amount
+    if user_id not in group_db["users"]: return await update.message.reply_text("❌ کشوری ندارید.")
+    if len(context.args) < 2: return await update.message.reply_text("❌ فرمت اشتباه. مثال: `/sendcity Italy 3`")
+
+    target_country = " ".join(context.args[:-1])
+    amount_str = context.args[-1]
+
+    if not amount_str.isdigit() or int(amount_str) <= 0: return await update.message.reply_text("❌ تعداد شهر نامعتبر است.")
+    amount = int(amount_str)
+    
+    target_id = get_user_id_by_country(group_db, target_country)
+    if not target_id: return await update.message.reply_text("❌ کشور پیدا نشد.")
+    if target_id == user_id: return await update.message.reply_text("❌ به خودتان؟")
+
+    user_data = group_db["users"][user_id]
+    target_data = group_db["users"][target_id]
+
+    if user_data.get("cities", 21) < amount:
+        return await update.message.reply_text("❌ شما این تعداد شهر برای واگذاری ندارید!")
+
+    user_data["cities"] -= amount
+    target_data["cities"] = target_data.get("cities", 21) + amount
+    save_db()
+
+    await update.message.reply_text(f"🏙 تعداد **{amount}** شهر از **{user_data['country']}** به **{target_country}** واگذار شد.", parse_mode='Markdown')
+    await check_bankruptcy(update, group_db, user_id)
+
+async def sell_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+
+    if user_id not in group_db["users"]: return await update.message.reply_text("❌ کشوری ندارید.")
+    if len(context.args) < 3: return await update.message.reply_text("❌ فرمت: `/sellcity [کشور] [تعداد شهر] [قیمت]`")
+
+    price_str = context.args[-1]
+    amount_str = context.args[-2]
+    target_country = " ".join(context.args[:-2])
+
+    if not (price_str.isdigit() and amount_str.isdigit()): return await update.message.reply_text("❌ قیمت و تعداد باید عدد باشند.")
+    
+    price = int(price_str)
+    amount = int(amount_str)
+    target_id = get_user_id_by_country(group_db, target_country)
+
+    if not target_id: return await update.message.reply_text("❌ کشور خریدار پیدا نشد.")
+    if group_db["users"][user_id].get("cities", 21) < amount: return await update.message.reply_text("❌ شهر کافی ندارید.")
+
+    group_db["market"][user_id] = {"target_id": target_id, "cities": amount, "price": price}
+    save_db()
+    
+    seller_name = group_db["users"][user_id]["country"]
+    await update.message.reply_text(f"📜 قرارداد فروش **{amount}** شهر به قیمت **{price}** سکه برای **{target_country}** ارسال شد.\nکشور خریدار باید با `/acceptcity {seller_name}` آن را تایید کند.", parse_mode='Markdown')
+
+async def accept_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    buyer_id = str(update.message.from_user.id)
+
+    if buyer_id not in group_db["users"]: return await update.message.reply_text("❌ کشوری ندارید.")
+    if len(context.args) == 0: return await update.message.reply_text("❌ فرمت: `/acceptcity [نام کشور فروشنده]`")
+
+    seller_country = " ".join(context.args)
+    seller_id = get_user_id_by_country(group_db, seller_country)
+
+    if not seller_id or seller_id not in group_db["market"]:
+        return await update.message.reply_text("❌ پیشنهاد فروشی از این کشور یافت نشد.")
+
+    offer = group_db["market"][seller_id]
+    if offer["target_id"] != buyer_id:
+        return await update.message.reply_text("❌ این پیشنهاد برای شما نیست.")
+
+    buyer_data = group_db["users"][buyer_id]
+    seller_data = group_db["users"][seller_id]
+
+    if buyer_data["money"] < offer["price"]:
+        return await update.message.reply_text("❌ بودجه کافی برای خرید ندارید.")
+
+    # انتقال
+    buyer_data["money"] -= offer["price"]
+    seller_data["money"] += offer["price"]
+    seller_data["cities"] -= offer["cities"]
+    buyer_data["cities"] = buyer_data.get("cities", 21) + offer["cities"]
+    
+    del group_db["market"][seller_id]
+    save_db()
+
+    await update.message.reply_text(f"🏙 معامله انجام شد! **{offer['cities']}** شهر به نقشه **{buyer_data['country']}** اضافه شد و {offer['price']} سکه پرداخت شد.", parse_mode='Markdown')
+    await check_bankruptcy(update, group_db, seller_id)
+
+# --- دستورات قبلی (اصلاح شده برای گروه‌ها) ---
+
+async def military(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"]: return await update.message.reply_text("❌ کشوری ندارید!")
+    if len(context.args) != 1 or not context.args[0].isdigit(): return await update.message.reply_text("❌ فرمت: `/military 50`")
+
+    amount = int(context.args[0])
+    cost = amount * 10
+    user_data = group_db["users"][user_id]
+    
+    if user_data["money"] < cost: return await update.message.reply_text(f"❌ بودجه کافی نیست! نیاز: {cost}")
+
+    user_data["money"] -= cost
+    user_data["army"] += amount
+    save_db()
+    await update.message.reply_text(f"🪖 **{amount}** نیروی جدید افزوده شد.\nهزینه: {cost} سکه.", parse_mode='Markdown')
+
+async def send_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"]: return
+    if len(context.args) < 2: return await update.message.reply_text("❌ فرمت: `/send Russia 1000`")
+
+    target_country = " ".join(context.args[:-1])
+    amount_str = context.args[-1]
+
+    if not amount_str.isdigit(): return await update.message.reply_text("❌ مبلغ باید عدد باشد.")
+    amount = int(amount_str)
+    target_id = get_user_id_by_country(group_db, target_country)
+
+    if not target_id: return await update.message.reply_text(f"❌ کشوری یافت نشد.")
+    if target_id == user_id: return await update.message.reply_text("❌ به خودتان؟")
+
+    user_data = group_db["users"][user_id]
+    if user_data["money"] < amount: return await update.message.reply_text("❌ خزانه کافی نیست!")
+
+    user_data["money"] -= amount
+    group_db["users"][target_id]["money"] += amount
+    save_db()
+    await update.message.reply_text(f"💸 مبلغ **{amount}** سکه به **{target_country}** منتقل شد.", parse_mode='Markdown')
+
+async def war(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"]: return
+    if len(context.args) == 0: return await update.message.reply_text("❌ مثال: `/war Germany`")
+    
+    target_country = " ".join(context.args)
+    target_id = get_user_id_by_country(group_db, target_country)
+
+    if not target_id: return await update.message.reply_text("❌ کشور پیدا نشد.")
+    if target_id == user_id: return
+    if is_at_war(group_db, user_id, target_id): return await update.message.reply_text("❌ در حال جنگ هستید!")
+    
+    if is_allied(group_db, user_id, target_id):
+        group_db["alliances"] = [a for a in group_db["alliances"] if set(a) != {user_id, target_id}]
+
+    group_db["wars"].append([user_id, target_id])
+    save_db()
+    await update.message.reply_text(f"🚨 **اعلان جنگ!**\nکشور **{group_db['users'][user_id]['country']}** به **{target_country}** اعلان جنگ داد!", parse_mode='Markdown')
+
+async def ally(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"]: return
+    if len(context.args) == 0: return await update.message.reply_text("❌ مثال: `/ally Italy`")
+    
+    target_country = " ".join(context.args)
+    target_id = get_user_id_by_country(group_db, target_country)
+
+    if not target_id: return await update.message.reply_text("❌ کشور پیدا نشد.")
+    if target_id == user_id: return
+    if is_allied(group_db, user_id, target_id): return await update.message.reply_text("❌ متحد هستید!")
+    if is_at_war(group_db, user_id, target_id): return await update.message.reply_text("❌ در حال جنگ هستید!")
+
+    if target_id not in group_db["requests"]: group_db["requests"][target_id] = {"ally": [], "peace": []}
+    if user_id not in group_db["requests"][target_id]["ally"]:
+        group_db["requests"][target_id]["ally"].append(user_id)
+        save_db()
+
+    my_country = group_db["users"][user_id]["country"]
+    await update.message.reply_text(f"✉️ درخواست اتحاد برای **{target_country}** ارسال شد. (پذیرش با `/accept {my_country}`)", parse_mode='Markdown')
+
+async def accept_ally(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"] or len(context.args) == 0: return
+    
+    target_country = " ".join(context.args)
+    requester_id = get_user_id_by_country(group_db, target_country)
+
+    if user_id in group_db["requests"] and requester_id in group_db["requests"][user_id]["ally"]:
+        group_db["requests"][user_id]["ally"].remove(requester_id)
+        group_db["alliances"].append([user_id, requester_id])
+        save_db()
+        await update.message.reply_text(f"🤝 پیمان اتحاد با **{target_country}** بسته شد.", parse_mode='Markdown')
     else:
-        return await update.message.reply_text("❌ موجودی ملک شما کافی نیست.")
+        await update.message.reply_text("❌ هیچ پیشنهاد اتحادی یافت نشد.")
 
-    listing = {
-        "id": len(g_db["market"]) + 1,
-        "seller_id": uid,
-        "type": itype,
-        "amount": amount,
-        "price": price
-    }
-    g_db["market"].append(listing)
-    save_db()
-    await update.message.reply_text(f"✅ آگهی فروش ثبت شد. کد کالا: {listing['id']}")
-
-async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    g_db = init_group(gid)
-    if not g_db["market"]: return await update.message.reply_text("بازار خالی است.")
-
-    text = "🏪 **بازار جهانی:**\n\n"
-    for item in g_db["market"]:
-        seller = g_db["users"][item['seller_id']]['country']
-        text += f"📦 کد {item['id']} | {item['amount']} عدد {item['type']} | قیمت: {item['price']:,} | فروشنده: {seller}\n"
+async def peace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
     
-    text += "\nبرای خرید: `/buy [کد]`"
-    await update.message.reply_text(text)
-
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-    if uid not in g_db["users"] or not context.args: return
-
-    item_id = int(context.args[0])
-    listing = next((x for x in g_db["market"] if x["id"] == item_id), None)
-
-    if not listing: return await update.message.reply_text("❌ کد کالا یافت نشد.")
-    u = g_db["users"][uid]
-
-    if u["money"] < listing["price"]:
-        return await update.message.reply_text("❌ پول شما کافی نیست.")
-
-    u["money"] -= listing["price"]
-    # واریز پول به فروشنده
-    if listing["seller_id"] in g_db["users"]:
-        g_db["users"][listing["seller_id"]]["money"] += listing["price"]
-
-    if listing["type"] == "city": u["cities"] += listing["amount"]
-    else: u["factories"] += listing["amount"]
-
-    g_db["market"].remove(listing)
-    save_db()
-    await update.message.reply_text("✅ معامله با موفقیت انجام شد!")
-
-async def attack_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # سیستم تخریب شهر در جنگ
-    gid = str(update.effective_chat.id)
-    uid = str(update.effective_user.id)
-    g_db = init_group(gid)
-    if uid not in g_db["users"] or not context.args: return
-
-    target_name = " ".join(context.args)
-    tid = None
-    for n, i in g_db["countries"].items():
-        if n.lower() == target_name.lower(): tid = i
+    if user_id not in group_db["users"] or len(context.args) == 0: return
     
-    if not tid: return await update.message.reply_text("❌ کشور یافت نشد.")
-    
-    u = g_db["users"][uid]
-    t = g_db["users"][tid]
+    target_country = " ".join(context.args)
+    target_id = get_user_id_by_country(group_db, target_country)
 
-    # جنگ ساده: اگر قدرت ۲ برابر باشد یک شهر تسخیر می‌شود
-    if u["army"] > t["army"] * 1.5:
-        t["cities"] -= 1
-        u["army"] -= int(t["army"] * 0.5)
-        t["army"] = 0
-        await update.message.reply_text(f"🔥 پیروزی! یک شهر از {target_name} تسخیر شد.")
-        
-        # چک کردن ورشکستگی
-        if t["cities"] <= 0:
-            await update.message.reply_text(f"🏴 کشور {target_name} به دلیل از دست دادن تمام شهرها ورشکست و نابود شد!")
-            del g_db["countries"][target_name]
-            del g_db["users"][tid]
+    if not target_id or not is_at_war(group_db, user_id, target_id): return await update.message.reply_text("❌ با این کشور در جنگ نیستید.")
+
+    if target_id not in group_db["requests"]: group_db["requests"][target_id] = {"ally": [], "peace": []}
+    if user_id not in group_db["requests"][target_id]["peace"]:
+        group_db["requests"][target_id]["peace"].append(user_id)
+        save_db()
+
+    my_country = group_db["users"][user_id]["country"]
+    await update.message.reply_text(f"🕊 درخواست صلح به **{target_country}** ارسال شد. (پذیرش با `/acceptpeace {my_country}`)", parse_mode='Markdown')
+
+async def accept_peace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    group_db = get_group_db(chat_id)
+    user_id = str(update.message.from_user.id)
+    
+    if user_id not in group_db["users"] or len(context.args) == 0: return
+    
+    target_country = " ".join(context.args)
+    requester_id = get_user_id_by_country(group_db, target_country)
+
+    if user_id in group_db["requests"] and requester_id in group_db["requests"][user_id]["peace"]:
+        group_db["requests"][user_id]["peace"].remove(requester_id)
+        group_db["wars"] = [w for w in group_db["wars"] if set(w) != {user_id, requester_id}]
+        save_db()
+        await update.message.reply_text(f"🕊 جنگ با **{target_country}** به پایان رسید.", parse_mode='Markdown')
     else:
-        u["army"] -= int(u["army"] * 0.4)
-        await update.message.reply_text("💀 شکست خوردید! تلفات سنگینی به ارتش شما وارد شد.")
-    
-    save_db()
+        await update.message.reply_text("❌ پیشنهادی یافت نشد.")
 
-# --- Main ---
+# --- اجرای ربات ---
 if __name__ == '__main__':
-    if not BOT_TOKEN:
-        print("لطفا توکن را وارد کنید")
-    else:
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_cmd)) # مشابه کد قبل
-        app.add_handler(CommandHandler("claim", claim))
-        app.add_handler(CommandHandler("profile", profile))
-        app.add_handler(CommandHandler("world", world))
-        app.add_handler(CommandHandler("tax", tax))
-        app.add_handler(CommandHandler("build", build))
-        app.add_handler(CommandHandler("rename", rename))
-        app.add_handler(CommandHandler("sell", sell))
-        app.add_handler(CommandHandler("market", market))
-        app.add_handler(CommandHandler("buy", buy))
-        app.add_handler(CommandHandler("set_menu", set_commands))
-        
-        print("Bot is running...")
-        app.run_polling()
+    if BOT_TOKEN == "توکن_ربات_خود_را_اینجا_قرار_دهید" or len(BOT_TOKEN) < 30:
+        print("❌ لطفاً ابتدا BOT_TOKEN را در داخل فایل ویرایش کنید!")
+        exit()
 
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # ثبت دستورات
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("claim", claim))
+    app.add_handler(CommandHandler("rename", rename_country))
+    app.add_handler(CommandHandler("color", set_color))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("world", world))
+    app.add_handler(CommandHandler("tax", tax))
+    app.add_handler(CommandHandler("military", military))
+    app.add_handler(CommandHandler("send", send_money))
+    app.add_handler(CommandHandler("sendcity", send_city))
+    app.add_handler(CommandHandler("sellcity", sell_city))
+    app.add_handler(CommandHandler("acceptcity", accept_city))
+    app.add_handler(CommandHandler("war", war))
+    app.add_handler(CommandHandler("ally", ally))
+    app.add_handler(CommandHandler("accept", accept_ally))
+    app.add_handler(CommandHandler("peace", peace))
+    app.add_handler(CommandHandler("acceptpeace", accept_peace))
+
+    print("✅ ربات ژئوپلیتیک روشن شد...")
+    app.run_polling()
